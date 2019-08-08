@@ -1,7 +1,9 @@
 module Main exposing (main)
 
+import Array
 import Bitwise
 import Browser
+import Debouncer.Messages as Debouncer exposing (Debouncer, fromSeconds, provideInput, settleWhenQuietFor, toDebouncer)
 import Dict exposing (Dict)
 import Element exposing (Element)
 import Element.Background as Background
@@ -13,6 +15,7 @@ import Http
 import Json.Decode as D
 import Json.Decode.Pipeline
 import List.Extra exposing (takeWhile)
+import Peer exposing (Address, Neighbor(..), State)
 import Process
 import Random exposing (Generator, Seed)
 import Task
@@ -20,104 +23,65 @@ import Time
 
 
 config =
-    { groupSize = 6
+    { groupSize = 8
     , offlineRecheck = 60000.0
     , messageTimeout = 3000.0
     , syncTimeout = 100.0
     , checkPeersTimeout = 250.0
     , deterministic = False -- no Process.sleep calls
+    , groupSyncDebouncing = False
     }
 
 
-type alias Address =
-    Int
-
-
 type alias Model =
-    { peers : Dict Address Peer
-    , commonPrefixGoal : List Char
+    { peers : Dict Address Peer.Model
+    , globalPrefixGoal : List Char
     , seed : Seed
     , neighborhoodSize : Int
     }
 
 
-type alias Peer =
-    { address : Address
-    , isOnline : Bool
-    , state : State
-    , prefix : Maybe (List Char)
-    , neighborStates : Dict Address (Maybe Neighbor)
-    , messagesSent : Int
-    , messagesReceived : Int
-    }
-
-
-type Neighbor
-    = Online State
-    | Offline
-
-
-type alias State =
-    Dict Address (Maybe (List Char))
-
-
 initialModel : ( Model, Cmd Msg )
 initialModel =
     let
+        neighborhoodSize =
+            ceiling (logBase 2 config.groupSize) + 1
+
         peers =
             List.range 0 (config.groupSize - 1)
-                |> List.map (\n -> ( n, initialPeer n ))
+                |> List.map
+                    (\n ->
+                        ( n
+                        , Peer.initialModel
+                            { syncTimeout = config.syncTimeout
+                            , groupSize = config.groupSize
+                            , neighborhoodSize = neighborhoodSize
+                            }
+                            n
+                        )
+                    )
                 |> Dict.fromList
     in
     ( { peers = peers
-      , commonPrefixGoal = []
+      , globalPrefixGoal = []
       , seed = Random.initialSeed 1001
-      , neighborhoodSize = (round (logBase 2 config.groupSize) // 2 + 1) * 2 + 1
+      , neighborhoodSize = neighborhoodSize
       }
     , Cmd.none
     )
 
 
-initialPeer : Address -> Peer
-initialPeer address =
-    let
-        initState =
-            List.range 0 (config.groupSize - 1)
-                |> List.map
-                    (\groupMemberAddress ->
-                        ( groupMemberAddress, Nothing )
-                    )
-                |> Dict.fromList
-                |> Dict.insert address (Just [])
-    in
-    { address = address
-    , isOnline = True
-    , state = initState
-    , prefix = Nothing
-    , neighborStates = Dict.singleton address <| Just <| Online initState
-    , messagesSent = 0
-    , messagesReceived = 0
-    }
-
-
 type Msg
     = NoOp
-    | CalculatePeers Address
     | RandomizePrefix Address
-    | UserChangePrefix Address String
-    | UpdatePrefix Address (List Char)
     | CalculateGlobalPrefixGoal
-    | CalculateLocalPrefixGoal Address
-    | CalculateCurrentState Address
-    | IncrementMessageSent Address
-    | IncrementMessageReceived Address
     | ResetMessageCount
     | ChangePeerStatus Address Address Neighbor
-    | ToggleOnline Address
     | AllOnline
     | AllOffline
+    | ToggleOnline Address
     | StartGroupSync Address
-    | RequestStateDelay
+    | SendStateDelay
         { from : Address
         , to : Address
         , state : State
@@ -133,40 +97,14 @@ type Msg
         , to : Address
         }
     | MarkUnknown Address Address
+    | PeerMsg Address Peer.Msg
 
 
 update : Msg -> Model -> ( Model, Cmd Msg )
 update msg model =
-    case msg of
+    case Debug.log "msg" msg of
         NoOp ->
             ( model, Cmd.none )
-
-        CalculatePeers address ->
-            Maybe.map
-                (\peer ->
-                    let
-                        newPeerDict =
-                            List.map
-                                (\neighborAddress ->
-                                    Dict.get neighborAddress peer.neighborStates
-                                        |> Maybe.withDefault Nothing
-                                        |> Tuple.pair neighborAddress
-                                )
-                                (chooseNeighbors peer model)
-                                |> Dict.fromList
-
-                        modelOne =
-                            { model
-                                | peers =
-                                    Dict.insert address
-                                        { peer | neighborStates = newPeerDict }
-                                        model.peers
-                            }
-                    in
-                    ( modelOne, Cmd.none )
-                )
-                (Dict.get address model.peers)
-                |> Maybe.withDefault ( model, Cmd.none )
 
         RandomizePrefix address ->
             Maybe.map
@@ -175,51 +113,7 @@ update msg model =
                         ( newPrefix, newSeed ) =
                             Random.step prefixGen model.seed
                     in
-                    update (UpdatePrefix address newPrefix) { model | seed = newSeed }
-                )
-                (Dict.get address model.peers)
-                |> Maybe.withDefault ( model, Cmd.none )
-
-        UserChangePrefix address newString ->
-            update (UpdatePrefix address (String.toList newString)) model
-
-        UpdatePrefix address prefix ->
-            Maybe.map
-                (\peer ->
-                    let
-                        newState =
-                            Dict.insert address (Just prefix) peer.state
-
-                        modelOne =
-                            { model
-                                | peers =
-                                    Dict.insert address
-                                        { peer
-                                            | state = newState
-                                            , neighborStates =
-                                                Dict.insert address
-                                                    (if peer.isOnline then
-                                                        Just (Online newState)
-
-                                                     else
-                                                        Just Offline
-                                                    )
-                                                    peer.neighborStates
-                                        }
-                                        model.peers
-                            }
-
-                        ( modelTwo, cmdTwo ) =
-                            update CalculateGlobalPrefixGoal modelOne
-
-                        ( modelThree, cmdThree ) =
-                            if not peer.isOnline then
-                                ( modelTwo, Cmd.none )
-
-                            else
-                                update (CalculateCurrentState address) modelTwo
-                    in
-                    ( modelThree, Cmd.batch [ cmdTwo, cmdThree ] )
+                    update (PeerMsg address <| Peer.UpdatePrefix newPrefix) { model | seed = newSeed }
                 )
                 (Dict.get address model.peers)
                 |> Maybe.withDefault ( model, Cmd.none )
@@ -228,21 +122,13 @@ update msg model =
             let
                 prefixes =
                     Dict.filter (\_ peer -> peer.isOnline) model.peers
-                        |> Dict.toList
-                        |> List.map
-                            (\( address, peer ) ->
-                                case Dict.get address peer.state of
-                                    Just (Just prefix) ->
-                                        prefix
-
-                                    _ ->
-                                        []
-                            )
+                        |> Dict.map (\_ peer -> peer.peerState)
+                        |> Dict.values
 
                 newGoal =
                     case ( List.head prefixes, List.tail prefixes ) of
                         ( Just head, Just tail ) ->
-                            List.foldl longestPrefix head tail
+                            List.foldl Peer.longestPrefix head tail
 
                         ( Just head, Nothing ) ->
                             head
@@ -250,100 +136,7 @@ update msg model =
                         _ ->
                             []
             in
-            ( { model | commonPrefixGoal = newGoal }, Cmd.none )
-
-        CalculateLocalPrefixGoal address ->
-            Maybe.map
-                (\peer ->
-                    ( { model
-                        | peers =
-                            Dict.insert address
-                                { peer | prefix = computeStatePrefix peer.state }
-                                model.peers
-                      }
-                    , Cmd.none
-                    )
-                )
-                (Dict.get address model.peers)
-                |> Maybe.withDefault ( model, Cmd.none )
-
-        CalculateCurrentState thisAddress ->
-            Maybe.map
-                (\peer ->
-                    let
-                        oldState =
-                            peer.state
-
-                        newState =
-                            let
-                                ( myStateInNeighborhood, otherStates ) =
-                                    peer.neighborStates
-                                        |> Dict.partition (\address _ -> address == thisAddress)
-                            in
-                            case Dict.get thisAddress myStateInNeighborhood |> Maybe.andThen identity of
-                                Just (Online myState) ->
-                                    Dict.foldl
-                                        addNeighborVotes
-                                        -- my state with initial votes
-                                        (Dict.map (\_ v -> [ ( v, 1 ) ]) myState)
-                                        otherStates
-                                        |> findWinner model.neighborhoodSize
-
-                                _ ->
-                                    peer.state
-                    in
-                    if oldState == newState then
-                        -- nothing to do
-                        ( model, Cmd.none )
-
-                    else
-                        -- need to update our neighbors
-                        let
-                            modelOne =
-                                { model
-                                    | peers =
-                                        Dict.insert
-                                            peer.address
-                                            { peer | state = newState }
-                                            model.peers
-                                }
-                        in
-                        update (StartGroupSync peer.address) modelOne
-                )
-                (Dict.get thisAddress model.peers)
-                |> Maybe.withDefault ( model, Cmd.none )
-
-        IncrementMessageSent address ->
-            Maybe.map
-                (\peer ->
-                    ( { model
-                        | peers =
-                            Dict.insert
-                                address
-                                { peer | messagesSent = peer.messagesSent + 1 }
-                                model.peers
-                      }
-                    , Cmd.none
-                    )
-                )
-                (Dict.get address model.peers)
-                |> Maybe.withDefault ( model, Cmd.none )
-
-        IncrementMessageReceived address ->
-            Maybe.map
-                (\peer ->
-                    ( { model
-                        | peers =
-                            Dict.insert
-                                address
-                                { peer | messagesReceived = peer.messagesReceived + 1 }
-                                model.peers
-                      }
-                    , Cmd.none
-                    )
-                )
-                (Dict.get address model.peers)
-                |> Maybe.withDefault ( model, Cmd.none )
+            ( { model | globalPrefixGoal = newGoal }, Cmd.none )
 
         ResetMessageCount ->
             ( { model
@@ -363,10 +156,10 @@ update msg model =
                     let
                         oldPeerStatus =
                             Dict.get otherPeerAddress peer.neighborStates
-                                |> Maybe.andThen identity
+                                |> Maybe.withDefault Unknown
 
                         newPeerStatus =
-                            Just otherPeerStatus
+                            otherPeerStatus
 
                         modelOne =
                             { model
@@ -383,20 +176,19 @@ update msg model =
                             }
 
                         ( modelTwo, cmdTwo ) =
-                            case ( oldPeerStatus, newPeerStatus ) of
-                                ( Just Offline, _ ) ->
-                                    update (CalculatePeers peerAddress) modelOne
-
-                                ( _, Just Offline ) ->
-                                    update (CalculatePeers peerAddress) modelOne
-
-                                _ ->
-                                    ( modelOne, Cmd.none )
+                            ( modelOne, Cmd.none )
 
                         ( modelThree, cmdThree ) =
-                            update (CalculateCurrentState peerAddress) modelTwo
+                            update (PeerMsg peerAddress <| Peer.CalculateLocalVote) modelTwo
+
+                        ( modelFour, cmdFour ) =
+                            if oldPeerStatus /= newPeerStatus then
+                                update (StartGroupSync peerAddress) modelThree
+
+                            else
+                                ( modelThree, Cmd.none )
                     in
-                    ( modelThree, Cmd.batch [ cmdTwo, cmdThree ] )
+                    ( modelFour, Cmd.batch [ cmdTwo, cmdThree, cmdFour ] )
                 )
                 (Dict.get peerAddress model.peers)
                 (Dict.get otherPeerAddress model.peers)
@@ -409,10 +201,7 @@ update msg model =
                         ( { model
                             | peers =
                                 Dict.insert peer.address
-                                    { peer
-                                        | isOnline = False
-                                        , neighborStates = Dict.singleton address (Just Offline)
-                                    }
+                                    { peer | isOnline = False }
                                     model.peers
                           }
                         , Cmd.none
@@ -429,13 +218,13 @@ update msg model =
                                 }
 
                             ( modelTwo, cmdTwo ) =
-                                update (CalculatePeers peer.address) modelOne
+                                update (PeerMsg address <| Peer.CalculatePeers) modelOne
 
                             ( modelThree, cmdThree ) =
                                 update CalculateGlobalPrefixGoal modelTwo
 
                             ( modelFour, cmdFour ) =
-                                update (CalculateCurrentState peer.address) modelThree
+                                update (PeerMsg peer.address <| Peer.CalculateLocalVote) modelThree
                         in
                         ( modelFour, Cmd.batch [ cmdTwo, cmdThree, cmdFour ] )
                 )
@@ -485,59 +274,44 @@ update msg model =
 
                     else
                         let
-                            ( firstModel, firstCmd ) =
-                                if not peer.isOnline then
-                                    ( model, Cmd.none )
-
-                                else
-                                    update (CalculatePeers peerAddress) model
-
                             ( finalModel, peerCmds ) =
-                                peer.neighborStates
-                                    |> Dict.keys
+                                peer.peers
                                     -- don't sync with yourself
                                     |> List.filter ((/=) peerAddress)
                                     |> List.foldl
-                                        (\neighborAddress ( foldModel, cmds ) ->
-                                            Maybe.map
-                                                (\neighborPeer ->
-                                                    let
-                                                        ( latency, newSeed ) =
-                                                            Random.step latencyGen foldModel.seed
+                                        (\neighborAddress ( currentModel, cmds ) ->
+                                            let
+                                                ( latency, newSeed ) =
+                                                    Random.step latencyGen currentModel.seed
 
-                                                        ( newModel, newCmd ) =
-                                                            update
-                                                                (RequestStateDelay
-                                                                    -- pull neighbor's state
-                                                                    -- XXX this could be replaced with an official request message
-                                                                    { to = peerAddress -- to me
-                                                                    , from = neighborAddress -- from my neighbor
-                                                                    , state = neighborPeer.state
-                                                                    }
-                                                                    latency
-                                                                )
-                                                                { foldModel | seed = newSeed }
-                                                    in
-                                                    ( newModel, cmds ++ [ newCmd ] )
-                                                )
-                                                (Dict.get neighborAddress model.peers)
-                                                |> Maybe.withDefault ( firstModel, [ firstCmd ] )
+                                                ( newModel, newCmd ) =
+                                                    update
+                                                        (SendStateDelay
+                                                            { from = peerAddress
+                                                            , to = neighborAddress
+                                                            , state = peer.vote
+                                                            }
+                                                            latency
+                                                        )
+                                                        { currentModel | seed = newSeed }
+                                            in
+                                            ( newModel, cmds ++ [ newCmd ] )
                                         )
-                                        ( firstModel, [ firstCmd ] )
+                                        ( model, [] )
                         in
                         ( finalModel, Cmd.batch peerCmds )
                 )
                 (Dict.get peerAddress model.peers)
                 |> Maybe.withDefault ( model, Cmd.none )
 
-        RequestStateDelay { from, to, state } latency ->
+        SendStateDelay { from, to, state } latency ->
             Maybe.map2
                 (\fromPeer toPeer ->
-                    if not fromPeer.isOnline then
-                        -- they can't send to you if they are offline
+                    if not toPeer.isOnline then
+                        -- they can't receive from you if they are offline
                         let
                             ( modelOne, cmdOne ) =
-                                update (IncrementMessageSent from) model
+                                update (PeerMsg from <| Peer.IncrementMessageSent) model
                         in
                         ( modelOne
                         , Cmd.batch
@@ -558,10 +332,10 @@ update msg model =
                             Delayed time ->
                                 let
                                     ( modelOne, cmdOne ) =
-                                        update (IncrementMessageSent from) model
+                                        update (PeerMsg from <| Peer.IncrementMessageSent) model
 
                                     ( modelTwo, cmdTwo ) =
-                                        update (IncrementMessageReceived to) modelOne
+                                        update (PeerMsg to <| Peer.IncrementMessageReceived) modelOne
                                 in
                                 ( modelTwo
                                 , Cmd.batch
@@ -588,7 +362,7 @@ update msg model =
                             Failed ->
                                 let
                                     ( modelOne, cmdOne ) =
-                                        update (IncrementMessageSent from) model
+                                        update (PeerMsg from <| Peer.IncrementMessageSent) model
                                 in
                                 ( modelOne
                                 , Cmd.batch
@@ -615,13 +389,8 @@ update msg model =
                         -- can't receive if you are offline
                         ( model, Cmd.none )
 
-                    else if List.member from (Dict.keys toPeer.neighborStates) then
-                        -- if they are one of our neighbors, update their vote
-                        update (ChangePeerStatus to from <| Online state) model
-
                     else
-                        -- not our neighbor
-                        ( model, Cmd.none )
+                        update (ChangePeerStatus to from <| Online state) model
                 )
                 (Dict.get to model.peers)
                 |> Maybe.withDefault ( model, Cmd.none )
@@ -634,7 +403,7 @@ update msg model =
                         ( model, Cmd.none )
 
                     else
-                        update (ChangePeerStatus to from Offline) model
+                        update (ChangePeerStatus from to Offline) model
                 )
                 (Dict.get from model.peers)
                 |> Maybe.withDefault ( model, Cmd.none )
@@ -650,8 +419,8 @@ update msg model =
                                         Dict.update otherAddress
                                             (Maybe.map
                                                 (\neighbor ->
-                                                    if neighbor == Just Offline then
-                                                        Nothing
+                                                    if neighbor == Offline then
+                                                        Unknown
 
                                                     else
                                                         neighbor
@@ -666,6 +435,20 @@ update msg model =
                 )
                 (Dict.get myAddress model.peers)
                 (Dict.get otherAddress model.peers)
+                |> Maybe.withDefault ( model, Cmd.none )
+
+        PeerMsg address peerMsg ->
+            Maybe.map
+                (\peer ->
+                    let
+                        ( newPeer, peerCmd ) =
+                            Peer.update peerMsg peer
+                    in
+                    ( { model | peers = Dict.insert address newPeer model.peers }
+                    , Cmd.map (PeerMsg address) peerCmd
+                    )
+                )
+                (Dict.get address model.peers)
                 |> Maybe.withDefault ( model, Cmd.none )
 
 
@@ -688,23 +471,38 @@ view model =
                   Element.paragraph []
                     [ Element.text "Group size: "
                     , Element.text
-                        (config.groupSize
+                        ((config.groupSize
+                            |> String.fromInt
+                         )
+                            ++ " ("
+                            ++ (model.peers
+                                    |> Dict.foldl
+                                        (\k v a ->
+                                            if v.isOnline then
+                                                a + 1
+
+                                            else
+                                                a
+                                        )
+                                        0
+                                    |> String.fromInt
+                               )
+                            ++ " online)"
+                        )
+                    , Element.text " | Members in sync: "
+                    , Element.text
+                        (model.peers
+                            |> Dict.foldl
+                                (\k v a ->
+                                    if v.vote == model.globalPrefixGoal then
+                                        a + 1
+
+                                    else
+                                        a
+                                )
+                                0
                             |> String.fromInt
                         )
-
-                    -- , Element.text " | Members in sync: "
-                    -- , Element.text
-                    --     (model.peers
-                    --         |> Dict.foldl
-                    --             (\k v a ->
-                    --                 if List.map Tuple.first v.neighborhoodVote == model.commonPrefixGoal then
-                    --                     a + 1
-                    --                 else
-                    --                     a
-                    --             )
-                    --             0
-                    --         |> String.fromInt
-                    --     )
                     , Element.text " | Messages sent: "
                     , Element.text
                         (messagesSent
@@ -716,6 +514,7 @@ view model =
                             |> round
                             |> String.fromInt
                         )
+                    , Element.text " | "
                     , Input.button
                         [ Border.color (Element.rgb 0.0 0.0 0.0)
                         , Border.width 1
@@ -749,24 +548,16 @@ view model =
                     ]
                 ]
             , Dict.toList model.peers
-                |> List.drop (0 * (config.groupSize // 3))
-                |> List.take (config.groupSize // 3)
+                |> List.drop (0 * (config.groupSize // 2))
+                |> List.take (config.groupSize // 2)
                 |> List.map (Tuple.second >> viewPeer model)
                 |> Element.row
                     [ Element.width Element.fill
                     , Element.height Element.fill
                     ]
             , Dict.toList model.peers
-                |> List.drop (1 * (config.groupSize // 3))
-                |> List.take (config.groupSize // 3)
-                |> List.map (Tuple.second >> viewPeer model)
-                |> Element.row
-                    [ Element.width Element.fill
-                    , Element.height Element.fill
-                    ]
-            , Dict.toList model.peers
-                |> List.drop (2 * (config.groupSize // 3))
-                -- |> List.take (config.groupSize // 3)
+                |> List.drop (1 * (config.groupSize // 2))
+                -- |> List.take (config.groupSize // 2)
                 |> List.map (Tuple.second >> viewPeer model)
                 |> Element.row
                     [ Element.width Element.fill
@@ -775,24 +566,21 @@ view model =
             ]
 
 
-viewPeer : Model -> Peer -> Element Msg
+viewPeer : Model -> Peer.Model -> Element Msg
 viewPeer model peer =
     Element.column
         [ Element.width Element.fill
         , Element.height Element.fill
+        , Border.color <|
+            if peer.isOnline then
+                if peer.vote == model.globalPrefixGoal then
+                    Element.rgb 0.0 1.0 0.0
 
-        -- , Border.color <|
-        --     if peer.isOnline then
-        --         if
-        --             List.Extra.takeWhile (\( _, c ) -> c == model.neighborhoodSize) peer.neighborhoodVote
-        --                 |> List.map Tuple.first
-        --                 |> (==) model.commonPrefixGoal
-        --         then
-        --             Element.rgb 0.0 1.0 0.0
-        --         else
-        --             Element.rgb 0.0 0.0 0.0
-        --     else
-        --         Element.rgb 1.0 0.0 0.0
+                else
+                    Element.rgb 0.0 0.0 0.0
+
+            else
+                Element.rgb 1.0 0.0 0.0
         , Border.width 2
         ]
         ([ Element.el [ Element.centerX ]
@@ -809,14 +597,21 @@ viewPeer model peer =
                 ]
             )
          , Input.text [ Element.width <| Element.px 200, Font.size 12 ]
-            { text =
-                peer.prefix
-                    |> Maybe.withDefault []
-                    |> String.fromList
-            , onChange = UserChangePrefix peer.address
+            { text = String.fromList peer.peerState
+            , onChange = PeerMsg peer.address << Peer.UserChangePrefix
             , label = Input.labelAbove [] (Element.text <| "Local Prefix")
             , placeholder = Just <| Input.placeholder [] (Element.text "< no state >")
             }
+         , Element.paragraph
+            [ Font.size 12
+            , Element.padding 5
+            ]
+            [ if peer.isOnline then
+                Element.text <| "Vote - " ++ String.fromList peer.vote
+
+              else
+                Element.text <| "Vote - (offline)"
+            ]
          , Input.button
             [ Border.color (Element.rgb 0.0 0.0 0.0)
             , Border.width 1
@@ -844,43 +639,32 @@ viewPeer model peer =
                         "Go Online"
             }
          ]
-            ++ (Dict.toList peer.neighborStates
+            ++ (peer.peers
                     |> List.map
-                        (\( address, status ) ->
-                            case status of
-                                Just neighbor ->
-                                    if List.member address (Dict.keys peer.neighborStates) then
-                                        [ Element.paragraph
-                                            [ Font.size 12
-                                            , Element.padding 5
-                                            ]
-                                            [ Element.text <| "Peer " ++ String.fromInt address ++ " - "
-                                            , case neighbor of
-                                                Online state ->
-                                                    Element.el
-                                                        [ Font.color <| Element.rgb 0.0 0.0 0.0
-                                                        , Border.color <| Element.rgb 0.0 1.0 0.0
-                                                        , Border.width 1
-                                                        ]
-                                                        (Element.text <|
-                                                            "Online: "
-                                                                ++ String.fromList (Maybe.withDefault [] <| computeStatePrefix state)
-                                                        )
-
-                                                Offline ->
-                                                    Element.el
-                                                        [ Font.color <| Element.rgb 1.0 1.0 1.0
-                                                        , Background.color <| Element.rgb 1.0 0.0 0.0
-                                                        ]
-                                                        (Element.text "Offline")
-                                            ]
-                                        ]
-
-                                    else
+                        (\neighborAddress ->
+                            [ Element.paragraph
+                                [ Font.size 12
+                                , Element.padding 5
+                                ]
+                                [ Element.text <| "Peer " ++ String.fromInt neighborAddress ++ " - "
+                                , if neighborAddress == peer.address then
+                                    Element.el
                                         []
+                                        (Element.text <| String.fromList peer.vote)
 
-                                _ ->
-                                    []
+                                  else
+                                    case Dict.get neighborAddress peer.neighborStates of
+                                        Just (Online prefix) ->
+                                            Element.el
+                                                []
+                                                (Element.text <| String.fromList prefix)
+
+                                        _ ->
+                                            Element.el
+                                                []
+                                                (Element.text "Unknown")
+                                ]
+                            ]
                         )
                     |> List.concat
                )
@@ -951,160 +735,3 @@ prefixGen =
         , ( 20.0, [ 'A', 'B', 'C', 'D', 'E' ] )
         , ( 40.0, [ 'A', 'B', 'C', 'D', 'E', 'F' ] )
         ]
-
-
-chooseNeighbors : Peer -> Model -> List Address
-chooseNeighbors peer model =
-    -- includes yourself as first entry
-    let
-        sortedPeers =
-            (config.groupSize - 1)
-                |> List.range 0
-                |> List.sortBy (Bitwise.xor peer.address)
-                |> List.indexedMap Tuple.pair
-                |> Dict.fromList
-
-        neighbors =
-            config.groupSize
-                |> logBase 2
-                |> ceiling
-                |> List.range 0
-                |> List.map (\n -> 2 ^ n - 1)
-                |> List.map
-                    (\i ->
-                        case Dict.get i sortedPeers of
-                            Just address ->
-                                [ address ]
-
-                            Nothing ->
-                                []
-                    )
-                |> List.concat
-
-        numOfflinePeers =
-            neighbors
-                |> List.map
-                    (\address ->
-                        case Dict.get address peer.neighborStates |> Maybe.andThen identity of
-                            Just Offline ->
-                                1
-
-                            _ ->
-                                0
-                    )
-                |> List.sum
-
-        alternativePeers =
-            sortedPeers
-                |> Dict.toList
-                |> List.filter
-                    (\( _, address ) ->
-                        let
-                            status =
-                                Dict.get address peer.neighborStates |> Maybe.andThen identity
-                        in
-                        not
-                            (List.member address neighbors
-                                || (status == Just Offline)
-                                || (address == peer.address)
-                            )
-                    )
-                |> List.map Tuple.second
-    in
-    List.append neighbors alternativePeers
-        |> List.take model.neighborhoodSize
-
-
-longestPrefix : List Char -> List Char -> List Char
-longestPrefix xs ys =
-    List.map2 Tuple.pair xs ys
-        |> takeWhile (\( x, y ) -> x == y)
-        |> List.map Tuple.first
-
-
-addNeighborVotes :
-    Address
-    -> Maybe Neighbor
-    -> Dict Address (List ( Maybe (List Char), Int ))
-    -> Dict Address (List ( Maybe (List Char), Int ))
-addNeighborVotes address theirState totalState =
-    case theirState of
-        Just (Online onlineState) ->
-            -- merge the current state with the total state
-            Dict.merge
-                addVotesToTotal
-                (\_ _ _ r -> r)
-                (\_ _ r -> r)
-                onlineState
-                -- not used
-                Dict.empty
-                totalState
-
-        _ ->
-            totalState
-
-
-addVotesToTotal :
-    Address
-    -> Maybe (List Char)
-    -> Dict Address (List ( Maybe (List Char), Int ))
-    -> Dict Address (List ( Maybe (List Char), Int ))
-addVotesToTotal address thisValue totalVotes =
-    Dict.update address
-        (\maybeVotes ->
-            case maybeVotes of
-                Just votes ->
-                    Just <|
-                        (List.foldr
-                            (\( mPrefix, voteCount ) ( newVotes, foundIt ) ->
-                                if thisValue == mPrefix then
-                                    ( ( mPrefix, voteCount + 1 ) :: newVotes, True )
-
-                                else
-                                    ( ( mPrefix, voteCount ) :: newVotes, foundIt )
-                            )
-                            ( [], False )
-                            votes
-                            |> (\( checkedState, foundIt ) ->
-                                    if foundIt then
-                                        checkedState
-
-                                    else
-                                        ( thisValue, 1 ) :: checkedState
-                               )
-                        )
-
-                Nothing ->
-                    Nothing
-        )
-        totalVotes
-
-
-findWinner : Int -> Dict Address (List ( Maybe (List Char), Int )) -> State
-findWinner neighborhoodSize totalVotes =
-    Dict.map
-        (\_ votes ->
-            List.filter (\( _, c ) -> c > neighborhoodSize // 2) votes
-                |> List.map Tuple.first
-                |> List.head
-                |> Maybe.withDefault Nothing
-        )
-        totalVotes
-
-
-computeStatePrefix : State -> Maybe (List Char)
-computeStatePrefix state =
-    Dict.foldl
-        (\_ mPrefix mAcc ->
-            case ( mPrefix, mAcc ) of
-                ( Just prefix, Just acc ) ->
-                    Just <| longestPrefix prefix acc
-
-                ( Just prefix, Nothing ) ->
-                    Just prefix
-
-                ( Nothing, acc ) ->
-                    acc
-        )
-        Nothing
-        state
