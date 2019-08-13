@@ -1,0 +1,22 @@
+<!DOCTYPE HTML>
+<html>
+
+<head>
+	<meta charset="UTF-8">
+	<title>Main</title>
+	<script src="main.js"></script>
+</head>
+
+<body>
+	<div id="elm-group-consensus"></div>
+	<script>
+		var app = Elm.Main.init(
+			{ node: document.getElementById("elm-group-consensus") }
+		);
+		app.ports.relayMessageOut.subscribe(function ({ from, to, state }) {
+			app.ports.relayMessageIn.send({ from, to, state })
+		});
+	</script>
+</body>
+
+</html>
