@@ -31,7 +31,7 @@ import Time exposing (Posix)
 config =
     { checkPeersTimeout = 250.0
     , deterministic = False -- no Process.sleep calls
-    , groupSize = 4
+    , groupSize = 3
     , groupSyncDebouncing = False
     , messageTimeout = 3000.0
     , offlineRecheck = 60000.0
@@ -61,7 +61,8 @@ initialModel : Model
 initialModel =
     let
         neighborhoodSize =
-            ceiling (logBase 2 config.groupSize) + 1
+            -- ceiling (logBase 2 config.groupSize) + 1
+            2
 
         initSeed =
             Random.initialSeed 1001
@@ -116,7 +117,7 @@ type Msg
     | DrawMessageSent Address Address (Maybe Posix)
     | GetSvgViewport (Result Error Viewport)
     | PeerMsg Address Peer.Msg
-    | RelayMessageIn { from : Address, to : Address, vote : String }
+    | RelayMessageIn { from : Address, to : Address, payload : String }
     | RelayRegistrationIn { from : Address, to : Address }
     | ResetMessageCount
     | ResizeWindow Int Int
@@ -234,25 +235,32 @@ update msg model =
             in
             ( modelTwo, Cmd.batch [ cmdOne, cmdTwo ] )
 
-        RelayMessageIn { from, to, vote } ->
+        RelayMessageIn { from, to, payload } ->
             case
                 D.decodeString
-                    (D.field "first" D.string
+                    (D.field "state" D.string
                         |> D.andThen
-                            (\first ->
-                                D.field "second" D.int
+                            (\state ->
+                                D.at [ "vote", "first" ] D.string
                                     |> D.andThen
-                                        (\second ->
-                                            D.succeed ( String.toList first, second )
+                                        (\first ->
+                                            D.at [ "vote", "second" ] D.int
+                                                |> D.andThen
+                                                    (\second ->
+                                                        D.succeed
+                                                            { state = String.toList state
+                                                            , vote = ( String.toList first, second )
+                                                            }
+                                                    )
                                         )
                             )
                     )
-                    vote
+                    payload
             of
-                Ok goodVote ->
+                Ok goodPayload ->
                     let
                         ( modelOne, cmdOne ) =
-                            update (PeerMsg to <| Peer.StateReceive { from = from, vote = goodVote }) model
+                            update (PeerMsg to <| Peer.StateReceive { from = from, payload = goodPayload }) model
 
                         ( modelTwo, cmdTwo ) =
                             update (DrawMessageSent from to Nothing) modelOne
@@ -784,7 +792,7 @@ main =
         }
 
 
-port relayMessageIn : ({ from : Address, to : Address, vote : String } -> msg) -> Sub msg
+port relayMessageIn : ({ from : Address, to : Address, payload : String } -> msg) -> Sub msg
 
 
 port relayRegistrationIn : ({ from : Address, to : Address } -> msg) -> Sub msg

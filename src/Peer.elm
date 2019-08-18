@@ -107,6 +107,10 @@ type alias State =
     List Char
 
 
+type alias Payload =
+    { state : State, vote : Vote }
+
+
 type Msg
     = NoOp
     | CalculateNeighborhoodVote
@@ -121,20 +125,20 @@ type Msg
     | RelayMessageOut
         { from : Address
         , to : Address
-        , vote : String
+        , payload : String
         }
     | RelayRegistrationOut
         { from : Address
         , to : Address
         }
-    | SendVoteDelay
+    | SendMessageDelay
         { from : Address
         , to : Address
-        , vote : Vote
+        , payload : Payload
         }
         Latency
     | StartGroupSync
-    | StateReceive { from : Address, vote : Vote }
+    | StateReceive { from : Address, payload : Payload }
     | ToggleOnline
     | UpdatePrefix (List Char)
     | UserChangePrefix String
@@ -180,26 +184,48 @@ update msg model =
                         model.neighbors
                         |> Tuple.second
             in
-            ( { model
-                | vote = Just newVote
-                , neighbors =
-                    Array.map
-                        (\( address, status ) ->
-                            if address == model.address then
-                                case status of
-                                    Offline ->
-                                        Debug.log "modelA" ( model.address, Offline )
+            if Just newVote == model.vote then
+                ( { model
+                    | vote = Just newVote
+                    , neighbors =
+                        Array.map
+                            (\( address, status ) ->
+                                if address == model.address then
+                                    case status of
+                                        Offline ->
+                                            ( model.address, Offline )
 
-                                    _ ->
-                                        Debug.log "modelB" ( model.address, Online newVote )
+                                        _ ->
+                                            ( model.address, Online newVote )
 
-                            else
-                                Debug.log "modelC" ( address, status )
-                        )
-                        (Debug.log "neighbors" model.neighbors)
-              }
-            , Cmd.none
-            )
+                                else
+                                    ( address, status )
+                            )
+                            model.neighbors
+                  }
+                , Cmd.none
+                )
+
+            else
+                update StartGroupSync
+                    { model
+                        | vote = Just newVote
+                        , neighbors =
+                            Array.map
+                                (\( address, status ) ->
+                                    if address == model.address then
+                                        case status of
+                                            Offline ->
+                                                ( model.address, Offline )
+
+                                            _ ->
+                                                ( model.address, Online newVote )
+
+                                    else
+                                        ( address, status )
+                                )
+                                model.neighbors
+                    }
 
         ChangeNeighborStatus neighborAddress neighborStatus ->
             {-
@@ -272,10 +298,13 @@ update msg model =
                                 Random.step latencyGen model.seed
                         in
                         update
-                            (SendVoteDelay
+                            (SendMessageDelay
                                 { from = model.address
                                 , to = from
-                                , vote = vote
+                                , payload =
+                                    { state = model.peerState
+                                    , vote = vote
+                                    }
                                 }
                                 latency
                             )
@@ -291,13 +320,13 @@ update msg model =
                         , Cmd.none
                         )
 
-        RelayMessageOut { from, to, vote } ->
-            ( model, relayMessageOut { from = from, to = to, vote = vote } )
+        RelayMessageOut { from, to, payload } ->
+            ( model, relayMessageOut { from = from, to = to, payload = payload } )
 
         RelayRegistrationOut { from, to } ->
             ( model, relayRegistrationOut { from = from, to = to } )
 
-        SendVoteDelay { to, vote } latency ->
+        SendMessageDelay { to, payload } latency ->
             if not model.isOnline then
                 -- can't send if you are offline
                 ( model, Cmd.none )
@@ -318,11 +347,25 @@ update msg model =
                                     RelayMessageOut
                                         { from = model.address
                                         , to = to
-                                        , vote =
+                                        , payload =
                                             E.encode 0 <|
                                                 E.object
-                                                    [ ( "first", E.string <| String.fromList <| Tuple.first vote )
-                                                    , ( "second", E.int <| Tuple.second vote )
+                                                    [ ( "state"
+                                                      , E.string (String.fromList payload.state)
+                                                      )
+                                                    , ( "vote"
+                                                      , E.object
+                                                            [ ( "first"
+                                                              , Tuple.first payload.vote
+                                                                    |> String.fromList
+                                                                    |> E.string
+                                                              )
+                                                            , ( "second"
+                                                              , Tuple.second payload.vote
+                                                                    |> E.int
+                                                              )
+                                                            ]
+                                                      )
                                                     ]
                                         }
                                 )
@@ -351,7 +394,7 @@ update msg model =
                             ]
                         )
 
-        StateReceive { from, vote } ->
+        StateReceive { from, payload } ->
             if not model.isOnline then
                 -- can't receive if you are offline
                 ( model, Cmd.none )
@@ -362,7 +405,7 @@ update msg model =
                         update IncrementMessageReceived model
 
                     ( modelTwo, cmdTwo ) =
-                        update (ChangeNeighborStatus from <| Online vote) modelOne
+                        update (ChangeNeighborStatus from <| Online payload.vote) modelOne
                 in
                 ( modelTwo, Cmd.batch [ cmdOne, cmdTwo ] )
 
@@ -405,7 +448,7 @@ update msg model =
                                                 action
 
                                             Stale _ ->
-                                                action
+                                                ( count + 1, currentModel, cmds )
 
                                             _ ->
                                                 ( count + 1, currentModel, cmds )
@@ -426,10 +469,10 @@ update msg model =
                                             case model.vote of
                                                 Just vote ->
                                                     update
-                                                        (SendVoteDelay
+                                                        (SendMessageDelay
                                                             { from = model.address
                                                             , to = neighborAddress
-                                                            , vote = vote
+                                                            , payload = { state = model.peerState, vote = vote }
                                                             }
                                                             latency
                                                         )
@@ -491,7 +534,18 @@ update msg model =
                 ( modelTwo, Cmd.batch [ cmdOne, cmdTwo ] )
 
         UpdatePrefix prefix ->
-            ( { model | peerState = prefix }, Cmd.none )
+            if model.isOnline then
+                update CalculateNeighborhoodVote
+                    { model
+                        | peerState = prefix
+                        , neighbors =
+                            Array.map
+                                (updateNeighborStatus ( model.address, Online ( prefix, model.address ) ))
+                                model.neighbors
+                    }
+
+            else
+                ( { model | peerState = prefix }, Cmd.none )
 
         UserChangePrefix newString ->
             update (UpdatePrefix (String.toList newString)) model
@@ -606,7 +660,7 @@ updateNeighborStatus ( newAddress, newStatus ) ( currentAddress, currentStatus )
       else
         -- this is not the entry for this neighbor, but if they are using an
         -- old status as their vote, we can probably mark that vote as stale
-        case Debug.log "test" ( newStatus, currentStatus ) of
+        case ( newStatus, currentStatus ) of
             ( Online ( newS, newA ), Online ( currentS, currentA ) ) ->
                 if newA /= currentA || longestPrefix newS currentS == newS then
                     currentStatus
@@ -619,7 +673,7 @@ updateNeighborStatus ( newAddress, newStatus ) ( currentAddress, currentStatus )
     )
 
 
-port relayMessageOut : { from : Address, to : Address, vote : String } -> Cmd msg
+port relayMessageOut : { from : Address, to : Address, payload : String } -> Cmd msg
 
 
 port relayRegistrationOut : { from : Address, to : Address } -> Cmd msg

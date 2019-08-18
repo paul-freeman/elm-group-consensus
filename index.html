@@ -13,8 +13,8 @@
 		var app = Elm.Main.init(
 			{ node: document.getElementById("elm-group-consensus") }
 		);
-		app.ports.relayMessageOut.subscribe(function ({ from, to, vote }) {
-			app.ports.relayMessageIn.send({ from, to, vote })
+		app.ports.relayMessageOut.subscribe(function ({ from, to, payload }) {
+			app.ports.relayMessageIn.send({ from, to, payload })
 		});
 		app.ports.relayRegistrationOut.subscribe(function ({ from, to }) {
 			app.ports.relayRegistrationIn.send({ from, to })
