@@ -31,11 +31,11 @@ import Time exposing (Posix)
 config =
     { checkPeersTimeout = 250.0
     , deterministic = False -- no Process.sleep calls
-    , groupSize = 3
+    , groupSize = 10
     , groupSyncDebouncing = False
-    , messageTimeout = 3000.0
+    , messageTimeout = 10000.0
     , offlineRecheck = 60000.0
-    , syncTimeout = 100.0
+    , syncTimeout = 200.0
     }
 
 
@@ -61,8 +61,7 @@ initialModel : Model
 initialModel =
     let
         neighborhoodSize =
-            -- ceiling (logBase 2 config.groupSize) + 1
-            2
+            ceiling (logBase 2 config.groupSize) + 1
 
         initSeed =
             Random.initialSeed 1001
@@ -236,27 +235,7 @@ update msg model =
             ( modelTwo, Cmd.batch [ cmdOne, cmdTwo ] )
 
         RelayMessageIn { from, to, payload } ->
-            case
-                D.decodeString
-                    (D.field "state" D.string
-                        |> D.andThen
-                            (\state ->
-                                D.at [ "vote", "first" ] D.string
-                                    |> D.andThen
-                                        (\first ->
-                                            D.at [ "vote", "second" ] D.int
-                                                |> D.andThen
-                                                    (\second ->
-                                                        D.succeed
-                                                            { state = String.toList state
-                                                            , vote = ( String.toList first, second )
-                                                            }
-                                                    )
-                                        )
-                            )
-                    )
-                    payload
-            of
+            case D.decodeString Peer.decoderPeerView payload of
                 Ok goodPayload ->
                     let
                         ( modelOne, cmdOne ) =
@@ -347,7 +326,7 @@ view model =
                         (model.peers
                             |> Dict.foldl
                                 (\k v a ->
-                                    if Maybe.map Tuple.first v.vote == Just model.globalPrefixGoal then
+                                    if Maybe.map (.vote >> .oldestState) v.consensus == Just model.globalPrefixGoal then
                                         a + 1
 
                                     else
@@ -542,7 +521,7 @@ drawSvgPeer centerX centerY radius model address peer =
         , Attributes.fill "white"
         , Attributes.stroke <|
             if peer.isOnline then
-                if Maybe.map Tuple.first peer.vote == Just model.globalPrefixGoal then
+                if Maybe.map (.vote >> .oldestState) peer.consensus == Just model.globalPrefixGoal then
                     "green"
 
                 else
@@ -552,7 +531,7 @@ drawSvgPeer centerX centerY radius model address peer =
                 "red"
         , Attributes.strokeWidth <|
             if peer.isOnline then
-                if Maybe.map Tuple.first peer.vote == Just model.globalPrefixGoal then
+                if Maybe.map (.vote >> .oldestState) peer.consensus == Just model.globalPrefixGoal then
                     "3"
 
                 else
@@ -568,6 +547,7 @@ drawSvgPeer centerX centerY radius model address peer =
     ]
         ++ (if Just address == model.hoverPeer then
                 peer.neighbors
+                    |> Array.slice 0 model.neighborhoodSize
                     |> Array.map Tuple.first
                     |> Array.map
                         (\neighborAddress ->
@@ -602,7 +582,7 @@ viewPeer model peer =
         , Element.height Element.fill
         , Border.color <|
             if peer.isOnline then
-                if Maybe.map Tuple.first peer.vote == Just model.globalPrefixGoal then
+                if Maybe.map (.vote >> .oldestState) peer.consensus == Just model.globalPrefixGoal then
                     Element.rgb 0.0 1.0 0.0
 
                 else
@@ -638,11 +618,19 @@ viewPeer model peer =
             [ if peer.isOnline then
                 Element.text <|
                     "Vote - "
-                        ++ (case peer.vote of
-                                Just ( prefix, address ) ->
-                                    String.fromList prefix
+                        ++ (case peer.consensus of
+                                Just consensus ->
+                                    String.fromList consensus.vote.oldestState
                                         ++ ":"
-                                        ++ String.fromInt address
+                                        ++ String.fromInt consensus.vote.peerWithThisState
+                                        ++ " ("
+                                        ++ (consensus.voters
+                                                |> Set.toList
+                                                |> List.map String.fromInt
+                                                |> List.intersperse ","
+                                                |> String.concat
+                                           )
+                                        ++ ")"
 
                                 Nothing ->
                                     "Nothing"
@@ -695,59 +683,65 @@ viewPeer model peer =
                         )
                         ( 0, [] )
                     |> Tuple.second
-                    |> List.map
+                    |> List.concatMap
                         (\( neighborAddress, neighborStatus ) ->
-                            [ Element.paragraph
-                                [ Font.size 12
-                                , Element.padding 5
-                                ]
-                                [ Element.text <| "Peer " ++ String.fromInt neighborAddress ++ " - "
-                                , case neighborStatus of
-                                    Online ( prefix, address ) ->
-                                        Element.el
+                            case neighborStatus of
+                                Online neighborView ->
+                                    [ Element.paragraph
+                                        [ Font.size 12
+                                        , Element.padding 5
+                                        ]
+                                        [ Element.text <| "Peer " ++ String.fromInt neighborAddress ++ " - "
+                                        , Element.el
                                             []
                                             (Element.text <|
-                                                String.fromList prefix
+                                                String.fromList neighborView.state
+                                                    ++ " | "
+                                                    ++ String.fromList neighborView.vote.oldestState
                                                     ++ ":"
-                                                    ++ String.fromInt address
+                                                    ++ String.fromInt neighborView.vote.peerWithThisState
                                             )
+                                        ]
+                                    ]
 
-                                    Stale ( prefix, address ) ->
-                                        Element.el
+                                Stale neighborView ->
+                                    [ Element.paragraph
+                                        [ Font.size 12
+                                        , Element.padding 5
+                                        ]
+                                        [ Element.text <| "Peer " ++ String.fromInt neighborAddress ++ " - "
+                                        , Element.el
                                             []
                                             (Element.text <|
-                                                String.fromList prefix
+                                                String.fromList neighborView.state
+                                                    ++ " | "
+                                                    ++ String.fromList neighborView.vote.oldestState
                                                     ++ ":"
-                                                    ++ String.fromInt address
+                                                    ++ String.fromInt neighborView.vote.peerWithThisState
                                                     ++ " (stale)"
                                             )
+                                        ]
+                                    ]
 
-                                    _ ->
-                                        Element.el
-                                            []
-                                            (Element.text "Unknown")
-                                ]
-                            ]
+                                _ ->
+                                    []
                         )
-                    |> List.concat
                )
             ++ [ Element.paragraph [ Font.size 12 ] [ Element.text "Registered peers" ] ]
-            ++ (peer.neighbees
-                    |> Set.toList
-                    |> List.map
-                        (\neighborAddress ->
-                            [ Element.paragraph
-                                [ Font.size 12
-                                , Element.padding 5
-                                ]
-                                [ Element.text <|
-                                    "Peer "
-                                        ++ String.fromInt neighborAddress
-                                ]
-                            ]
-                        )
-                    |> List.concat
-               )
+            ++ [ Element.paragraph
+                    [ Font.size 12
+                    , Element.padding 5
+                    ]
+                    [ Element.text <|
+                        "Peers "
+                            ++ (peer.neighbees
+                                    |> Set.toList
+                                    |> List.map String.fromInt
+                                    |> List.intersperse ","
+                                    |> String.concat
+                               )
+                    ]
+               ]
             ++ [ Element.paragraph [ Font.size 12 ]
                     [ Element.text
                         ("Messages sent: " ++ String.fromInt peer.messagesSent)

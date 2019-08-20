@@ -6,6 +6,7 @@ port module Peer exposing
     , State
     , Vote
     , chooseNeighbors
+    , decoderPeerView
     , initialModel
     , longestPrefix
     , update
@@ -16,6 +17,7 @@ import Array.Extra exposing (removeAt)
 import Bitwise
 import Debouncer.Messages as Debouncer exposing (Debouncer, fromSeconds, provideInput, settleWhenQuietFor, toDebouncer)
 import Dict exposing (Dict)
+import Json.Decode as D exposing (Decoder)
 import Json.Encode as E
 import List.Extra exposing (takeWhile)
 import Process
@@ -40,7 +42,9 @@ type alias Address =
 
 
 type alias Vote =
-    ( List Char, Address )
+    { oldestState : List Char
+    , peerWithThisState : Address
+    }
 
 
 type alias Model =
@@ -58,7 +62,7 @@ type alias Model =
     , neighbees : Set Address
     , peerState : List Char
     , seed : Seed
-    , vote : Maybe Vote
+    , consensus : Maybe { voters : Set Address, vote : Vote }
     }
 
 
@@ -92,14 +96,14 @@ initialModel config address =
     , neighbees = Set.empty
     , peerState = []
     , seed = config.seed
-    , vote = Nothing
+    , consensus = Nothing
     }
 
 
 type Neighbor
-    = Online Vote
+    = Online PeerView
     | Offline
-    | Stale Vote
+    | Stale PeerView
     | Unknown
 
 
@@ -107,8 +111,8 @@ type alias State =
     List Char
 
 
-type alias Payload =
-    { state : State, vote : Vote }
+type alias PeerView =
+    { state : State, voters : Set Address, vote : Vote }
 
 
 type Msg
@@ -134,11 +138,11 @@ type Msg
     | SendMessageDelay
         { from : Address
         , to : Address
-        , payload : Payload
+        , payload : PeerView
         }
         Latency
     | StartGroupSync
-    | StateReceive { from : Address, payload : Payload }
+    | StateReceive { from : Address, payload : PeerView }
     | ToggleOnline
     | UpdatePrefix (List Char)
     | UserChangePrefix String
@@ -160,43 +164,62 @@ update msg model =
 
         CalculateNeighborhoodVote ->
             let
-                newVote =
+                initialState =
+                    { voters = Set.empty
+                    , vote =
+                        { oldestState = model.peerState
+                        , peerWithThisState = model.address
+                        }
+                    }
+
+                newConsensus =
                     Array.foldl
-                        (\( neighborAddress, neighborStatus ) ( count, ( prefix, address ) ) ->
-                            if count >= model.config.neighborhoodSize then
-                                ( count, ( prefix, address ) )
+                        (\( neighborAddress, neighborStatus ) acc ->
+                            if Set.size acc.voters >= model.config.neighborhoodSize then
+                                -- we have enough votes
+                                acc
 
                             else
                                 case neighborStatus of
-                                    Online ( peerPrefix, peerAddress ) ->
-                                        ( count + 1
-                                        , if longestPrefix prefix peerPrefix == prefix then
-                                            ( prefix, address )
+                                    Online neighborView ->
+                                        { voters = Set.insert neighborAddress acc.voters
+                                        , vote =
+                                            if
+                                                longestPrefix
+                                                    acc.vote.oldestState
+                                                    neighborView.vote.oldestState
+                                                    == acc.vote.oldestState
+                                            then
+                                                acc.vote
 
-                                          else
-                                            ( peerPrefix, peerAddress )
-                                        )
+                                            else
+                                                neighborView.vote
+                                        }
 
                                     _ ->
-                                        ( count, ( prefix, address ) )
+                                        acc
                         )
-                        ( 0, ( model.peerState, model.address ) )
+                        initialState
                         model.neighbors
-                        |> Tuple.second
             in
-            if Just newVote == model.vote then
+            if Just newConsensus == model.consensus then
                 ( { model
-                    | vote = Just newVote
+                    | consensus = Just newConsensus
                     , neighbors =
                         Array.map
                             (\( address, status ) ->
                                 if address == model.address then
                                     case status of
-                                        Offline ->
-                                            ( model.address, Offline )
+                                        Online neighborStatus ->
+                                            ( model.address
+                                            , Online
+                                                { neighborStatus
+                                                    | vote = newConsensus.vote
+                                                }
+                                            )
 
-                                        _ ->
-                                            ( model.address, Online newVote )
+                                        anythingElse ->
+                                            ( model.address, anythingElse )
 
                                 else
                                     ( address, status )
@@ -207,19 +230,24 @@ update msg model =
                 )
 
             else
-                update StartGroupSync
+                update
+                    (StartGroupSync
+                        |> provideInput
+                        |> ReadyToGroupSync
+                    )
                     { model
-                        | vote = Just newVote
+                        | consensus = Just newConsensus
                         , neighbors =
                             Array.map
                                 (\( address, status ) ->
-                                    if address == model.address then
-                                        case status of
-                                            Offline ->
-                                                ( model.address, Offline )
-
-                                            _ ->
-                                                ( model.address, Online newVote )
+                                    if address == model.address && model.isOnline then
+                                        ( model.address
+                                        , Online
+                                            { state = model.peerState
+                                            , voters = newConsensus.voters
+                                            , vote = newConsensus.vote
+                                            }
+                                        )
 
                                     else
                                         ( address, status )
@@ -242,7 +270,7 @@ update msg model =
                 { model
                     | neighbors =
                         Array.map
-                            (updateNeighborStatus ( neighborAddress, neighborStatus ))
+                            (updateNeighborStatus model ( neighborAddress, neighborStatus ))
                             model.neighbors
                 }
 
@@ -291,8 +319,8 @@ update msg model =
                 ( model, Cmd.none )
 
             else
-                case model.vote of
-                    Just vote ->
+                case model.consensus of
+                    Just consensus ->
                         let
                             ( latency, newSeed ) =
                                 Random.step latencyGen model.seed
@@ -303,7 +331,8 @@ update msg model =
                                 , to = from
                                 , payload =
                                     { state = model.peerState
-                                    , vote = vote
+                                    , voters = consensus.voters
+                                    , vote = consensus.vote
                                     }
                                 }
                                 latency
@@ -347,26 +376,7 @@ update msg model =
                                     RelayMessageOut
                                         { from = model.address
                                         , to = to
-                                        , payload =
-                                            E.encode 0 <|
-                                                E.object
-                                                    [ ( "state"
-                                                      , E.string (String.fromList payload.state)
-                                                      )
-                                                    , ( "vote"
-                                                      , E.object
-                                                            [ ( "first"
-                                                              , Tuple.first payload.vote
-                                                                    |> String.fromList
-                                                                    |> E.string
-                                                              )
-                                                            , ( "second"
-                                                              , Tuple.second payload.vote
-                                                                    |> E.int
-                                                              )
-                                                            ]
-                                                      )
-                                                    ]
+                                        , payload = E.encode 0 (encoderPeerView payload)
                                         }
                                 )
                                 (if model.config.deterministic then
@@ -405,7 +415,7 @@ update msg model =
                         update IncrementMessageReceived model
 
                     ( modelTwo, cmdTwo ) =
-                        update (ChangeNeighborStatus from <| Online payload.vote) modelOne
+                        update (ChangeNeighborStatus from <| Online payload) modelOne
                 in
                 ( modelTwo, Cmd.batch [ cmdOne, cmdTwo ] )
 
@@ -466,13 +476,17 @@ update msg model =
                                             Random.step latencyGen currentModel.seed
 
                                         ( newModel, newCmd ) =
-                                            case model.vote of
-                                                Just vote ->
+                                            case model.consensus of
+                                                Just consensus ->
                                                     update
                                                         (SendMessageDelay
                                                             { from = model.address
                                                             , to = neighborAddress
-                                                            , payload = { state = model.peerState, vote = vote }
+                                                            , payload =
+                                                                { state = model.peerState
+                                                                , voters = consensus.voters
+                                                                , vote = consensus.vote
+                                                                }
                                                             }
                                                             latency
                                                         )
@@ -540,7 +554,19 @@ update msg model =
                         | peerState = prefix
                         , neighbors =
                             Array.map
-                                (updateNeighborStatus ( model.address, Online ( prefix, model.address ) ))
+                                (updateNeighborStatus
+                                    model
+                                    ( model.address
+                                    , Online
+                                        { state = prefix
+                                        , voters = Set.singleton model.address
+                                        , vote =
+                                            { oldestState = prefix
+                                            , peerWithThisState = model.address
+                                            }
+                                        }
+                                    )
+                                )
                                 model.neighbors
                     }
 
@@ -557,7 +583,7 @@ chooseNeighbors address groupSize =
     let
         sortedPeers =
             List.range 0 (groupSize - 1)
-                |> List.sortBy (abs << (-) address)
+                |> List.sortBy (\x -> min (abs (x - address)) (groupSize - abs (x - address)))
                 |> Array.fromList
 
         indices =
@@ -635,17 +661,31 @@ prefixGen =
         ]
 
 
-updateNeighborStatus : ( Address, Neighbor ) -> ( Address, Neighbor ) -> ( Address, Neighbor )
-updateNeighborStatus ( newAddress, newStatus ) ( currentAddress, currentStatus ) =
+updateNeighborStatus : Model -> ( Address, Neighbor ) -> ( Address, Neighbor ) -> ( Address, Neighbor )
+updateNeighborStatus model ( receivedFromAddress, receivedStatus ) ( currentAddress, currentStatus ) =
+    -- TODO: This needs to take into account the model, which is currently not
+    -- used. When a neighbor sends a vote which is superceded by information in
+    -- our model, we should make that peers vote as stale, so it is not used in
+    -- determining our vote.
     ( currentAddress
-    , if newAddress == currentAddress then
-        -- update this neighbor to this status (unless it's is a stale status)
-        case ( newStatus, currentStatus ) of
-            ( Online ( newS, newA ), Online ( currentS, currentA ) ) ->
-                if newA /= currentA || longestPrefix newS currentS /= newS then
+    , if receivedFromAddress == currentAddress then
+        -- update this neighbor to this status (unless it is a stale status)
+        case ( receivedStatus, currentStatus ) of
+            ( Online newView, Online currentView ) ->
+                if
+                    (||)
+                        (newView.vote.peerWithThisState
+                            /= currentView.vote.peerWithThisState
+                        )
+                        (longestPrefix
+                            newView.vote.oldestState
+                            currentView.vote.oldestState
+                            /= newView.vote.oldestState
+                        )
+                then
                     -- it means the new status is a longer sequence or a new
                     -- peer
-                    newStatus
+                    receivedStatus
 
                 else
                     -- it means the new status is using the same address, but
@@ -655,22 +695,117 @@ updateNeighborStatus ( newAddress, newStatus ) ( currentAddress, currentStatus )
 
             _ ->
                 -- anything else, just update it
-                newStatus
+                receivedStatus
 
       else
         -- this is not the entry for this neighbor, but if they are using an
         -- old status as their vote, we can probably mark that vote as stale
-        case ( newStatus, currentStatus ) of
-            ( Online ( newS, newA ), Online ( currentS, currentA ) ) ->
-                if newA /= currentA || longestPrefix newS currentS == newS then
-                    currentStatus
+        case ( receivedStatus, currentStatus ) of
+            ( Online receivedView, Online currentView ) ->
+                if
+                    (&&)
+                        (receivedFromAddress
+                            == currentView.vote.peerWithThisState
+                        )
+                        (longestPrefix
+                            receivedView.state
+                            currentView.vote.oldestState
+                            /= receivedView.state
+                        )
+                then
+                    -- This is the case where we received new state from a peer
+                    -- (ex. Peer 2 says they are at state 'ABC' ) but this
+                    -- neighbor is using an old state of the peer in their vote
+                    -- (ex. Peer 3 says peer 2 is the oldest state at 'AB'). We
+                    -- know the peer has advanced beyond this state, so we mark
+                    -- this neighbor's vote as stale.
+                    Stale currentView
+
+                else if
+                    (&&)
+                        (Set.member
+                            currentView.vote.peerWithThisState
+                            (Set.insert receivedView.vote.peerWithThisState receivedView.voters)
+                        )
+                        (longestPrefix
+                            receivedView.vote.oldestState
+                            currentView.vote.oldestState
+                            /= receivedView.vote.oldestState
+                        )
+                then
+                    -- This is the case where we received a new vote from a peer
+                    -- (ex. Peer 3 says peer 2 is at state 'ABC'), but this
+                    -- neighbor says the peer is at an older state (ex. Peer 1
+                    -- says peer 2 is at state 'AB'). We know the peer has
+                    -- advanced beyond this state, so we mark this neighbor's
+                    -- vote as stale.
+                    Stale currentView
 
                 else
-                    Stale ( currentS, currentA )
+                    Online currentView
 
             _ ->
                 currentStatus
     )
+
+
+decoderPeerView : Decoder PeerView
+decoderPeerView =
+    D.field "state" D.string
+        |> D.andThen
+            (\state ->
+                (D.map Set.fromList <| D.at [ "vote", "voters" ] (D.list D.int))
+                    |> D.andThen
+                        (\voters ->
+                            (D.map String.toList <| D.at [ "vote", "results", "oldestState" ] D.string)
+                                |> D.andThen
+                                    (\oldestState ->
+                                        D.at [ "vote", "results", "peerWithThisState" ] D.int
+                                            |> D.andThen
+                                                (\peerWithThisState ->
+                                                    D.succeed
+                                                        { state = String.toList state
+                                                        , voters = voters
+                                                        , vote =
+                                                            { oldestState = oldestState
+                                                            , peerWithThisState = peerWithThisState
+                                                            }
+                                                        }
+                                                )
+                                    )
+                        )
+            )
+
+
+encoderPeerView : PeerView -> E.Value
+encoderPeerView peerView =
+    E.object
+        [ ( "state"
+          , E.string (String.fromList peerView.state)
+          )
+        , ( "vote"
+          , E.object
+                [ ( "voters"
+                  , peerView.voters
+                        |> Set.toList
+                        |> E.list E.int
+                  )
+                , ( "results"
+                  , E.object
+                        [ ( "oldestState"
+                          , peerView.vote.oldestState
+                                |> String.fromList
+                                |> E.string
+                          )
+                        , ( "peerWithThisState"
+                          , peerView.vote.peerWithThisState
+                                |> E.int
+                          )
+                        ]
+                  )
+                ]
+          )
+        ]
 
 
 port relayMessageOut : { from : Address, to : Address, payload : String } -> Cmd msg
