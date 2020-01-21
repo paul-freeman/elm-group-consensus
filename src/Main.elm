@@ -1,11 +1,9 @@
 port module Main exposing (main)
 
 import Array
-import Bitwise
 import Browser
 import Browser.Dom exposing (Error, Viewport)
 import Browser.Events
-import Debouncer.Messages as Debouncer exposing (Debouncer, fromSeconds, provideInput, settleWhenQuietFor, toDebouncer)
 import Dict exposing (Dict)
 import Element exposing (Element)
 import Element.Background as Background
@@ -13,13 +11,9 @@ import Element.Border as Border
 import Element.Font as Font
 import Element.Input as Input
 import Html exposing (Html)
-import Http
 import Json.Decode as D
-import Json.Decode.Pipeline
-import List.Extra exposing (takeWhile)
-import Peer exposing (Address, Neighbor(..), State, Vote)
-import Process
-import Random exposing (Generator, Seed)
+import Peer exposing (Address, Neighbor(..))
+import Random exposing (Seed)
 import Set
 import Svg exposing (Svg, svg)
 import Svg.Attributes as Attributes
@@ -28,10 +22,22 @@ import Task
 import Time exposing (Posix)
 
 
+type alias Config =
+    { checkPeersTimeout : Float
+    , deterministic : Bool
+    , groupSize : Int
+    , groupSyncDebouncing : Bool
+    , messageTimeout : Float
+    , offlineRecheck : Float
+    , syncTimeout : Float
+    }
+
+
+config : Config
 config =
     { checkPeersTimeout = 250.0
     , deterministic = False -- no Process.sleep calls
-    , groupSize = 10
+    , groupSize = 256
     , groupSyncDebouncing = False
     , messageTimeout = 10000.0
     , offlineRecheck = 60000.0
@@ -61,7 +67,7 @@ initialModel : Model
 initialModel =
     let
         neighborhoodSize =
-            ceiling (logBase 2 config.groupSize) + 1
+            ceiling (logBase 2 (toFloat config.groupSize)) + 1
 
         initSeed =
             Random.initialSeed 1001
@@ -103,7 +109,7 @@ initialModel =
     , neighborhoodSize = neighborhoodSize
     , peers = peers
     , seed = modelSeed
-    , svgView = False
+    , svgView = True
     , svgViewport = Nothing
     , time = 0
     }
@@ -291,14 +297,14 @@ view model =
             [ Element.width Element.fill
             , Element.height Element.fill
             ]
-            ([ Element.row
+            (Element.row
                 [ Element.width Element.fill
                 , Element.height <| Element.px 50
                 ]
                 [ let
                     messagesSent =
                         model.peers
-                            |> Dict.foldl (\k v a -> v.messagesSent + a) 0
+                            |> Dict.foldl (\_ v a -> v.messagesSent + a) 0
                   in
                   Element.paragraph []
                     [ Element.text "Group size: "
@@ -309,7 +315,7 @@ view model =
                             ++ " ("
                             ++ (model.peers
                                     |> Dict.foldl
-                                        (\k v a ->
+                                        (\_ v a ->
                                             if v.isOnline then
                                                 a + 1
 
@@ -325,7 +331,7 @@ view model =
                     , Element.text
                         (model.peers
                             |> Dict.foldl
-                                (\k v a ->
+                                (\_ v a ->
                                     if Maybe.map (.vote >> .oldestState) v.consensus == Just model.globalPrefixGoal then
                                         a + 1
 
@@ -342,7 +348,7 @@ view model =
                         )
                     , Element.text " | Messages per member: "
                     , Element.text
-                        ((toFloat messagesSent / config.groupSize)
+                        ((toFloat messagesSent / toFloat config.groupSize)
                             |> round
                             |> String.fromInt
                         )
@@ -389,8 +395,7 @@ view model =
                         }
                     ]
                 ]
-             ]
-                ++ (if model.svgView then
+                :: (if model.svgView then
                         [ Element.html <| viewSvg model ]
 
                     else
@@ -442,25 +447,15 @@ viewSvg model =
         , Attributes.height <| String.fromInt height
         , Attributes.viewBox <| "0 0 " ++ String.fromInt width ++ " " ++ String.fromInt height
         ]
-        ([ Svg.circle
-            [ Attributes.cx <| String.fromInt halfWidth
-            , Attributes.cy <| String.fromInt halfHeight
-            , Attributes.r <| String.fromInt radius
-            , Attributes.fill "white"
-            , Attributes.stroke "black"
-            , Attributes.strokeWidth "1"
-            ]
-            []
-         ]
-            ++ (model.drawLines
-                    |> List.map
-                        (drawMessageLine
-                            halfWidth
-                            halfHeight
-                            radius
-                            model.time
-                        )
-               )
+        ((model.drawLines
+            |> List.map
+                (drawMessageLine
+                    halfWidth
+                    halfHeight
+                    radius
+                    model.time
+                )
+         )
             ++ (model.peers
                     |> Dict.map
                         (drawSvgPeer
@@ -479,16 +474,16 @@ drawMessageLine : Int -> Int -> Int -> Int -> { from : Address, to : Address, ti
 drawMessageLine centerX centerY radius now { from, to, time } =
     let
         myX =
-            toFloat centerX + toFloat radius * cos (turns (toFloat from / config.groupSize))
+            toFloat centerX + toFloat radius * cos (turns (toFloat from / toFloat config.groupSize))
 
         myY =
-            toFloat centerY + toFloat radius * sin (turns (toFloat from / config.groupSize))
+            toFloat centerY + toFloat radius * sin (turns (toFloat from / toFloat config.groupSize))
 
         theirX =
-            toFloat centerX + toFloat radius * cos (turns (toFloat to / config.groupSize))
+            toFloat centerX + toFloat radius * cos (turns (toFloat to / toFloat config.groupSize))
 
         theirY =
-            toFloat centerY + toFloat radius * sin (turns (toFloat to / config.groupSize))
+            toFloat centerY + toFloat radius * sin (turns (toFloat to / toFloat config.groupSize))
 
         delta =
             1 - (toFloat (now - time) / 3000)
@@ -509,15 +504,15 @@ drawSvgPeer : Int -> Int -> Int -> Model -> Address -> Peer.Model -> List (Svg M
 drawSvgPeer centerX centerY radius model address peer =
     let
         myX =
-            toFloat centerX + toFloat radius * cos (turns (toFloat address / config.groupSize))
+            toFloat centerX + toFloat radius * cos (turns (toFloat address / toFloat config.groupSize))
 
         myY =
-            toFloat centerY + toFloat radius * sin (turns (toFloat address / config.groupSize))
+            toFloat centerY + toFloat radius * sin (turns (toFloat address / toFloat config.groupSize))
     in
-    [ Svg.circle
+    Svg.circle
         [ Attributes.cx <| String.fromFloat myX
         , Attributes.cy <| String.fromFloat myY
-        , Attributes.r <| String.fromFloat <| 0.6 * pi * toFloat radius / config.groupSize
+        , Attributes.r <| String.fromFloat <| 0.6 * pi * toFloat radius / toFloat config.groupSize
         , Attributes.fill "white"
         , Attributes.stroke <|
             if peer.isOnline then
@@ -544,8 +539,7 @@ drawSvgPeer centerX centerY radius model address peer =
         , Events.onMouseOut (SetHoverPeer Nothing)
         ]
         []
-    ]
-        ++ (if Just address == model.hoverPeer then
+        :: (if Just address == model.hoverPeer then
                 peer.neighbors
                     |> Array.slice 0 model.neighborhoodSize
                     |> Array.map Tuple.first
@@ -553,10 +547,10 @@ drawSvgPeer centerX centerY radius model address peer =
                         (\neighborAddress ->
                             let
                                 theirX =
-                                    toFloat centerX + toFloat radius * cos (turns (toFloat neighborAddress / config.groupSize))
+                                    toFloat centerX + toFloat radius * cos (turns (toFloat neighborAddress / toFloat config.groupSize))
 
                                 theirY =
-                                    toFloat centerY + toFloat radius * sin (turns (toFloat neighborAddress / config.groupSize))
+                                    toFloat centerY + toFloat radius * sin (turns (toFloat neighborAddress / toFloat config.groupSize))
                             in
                             Svg.line
                                 [ Attributes.x1 <| String.fromFloat myX
@@ -666,8 +660,8 @@ viewPeer model peer =
                         "Go Online"
             }
          ]
-            ++ [ Element.paragraph [ Font.size 12 ] [ Element.text "Neighbor votes" ] ]
-            ++ (peer.neighbors
+            ++ Element.paragraph [ Font.size 12 ] [ Element.text "Neighbor votes" ]
+            :: (peer.neighbors
                     |> Array.foldl
                         (\( address, neighbor ) ( count, list ) ->
                             if count >= model.neighborhoodSize then
@@ -727,8 +721,8 @@ viewPeer model peer =
                                     []
                         )
                )
-            ++ [ Element.paragraph [ Font.size 12 ] [ Element.text "Registered peers" ] ]
-            ++ [ Element.paragraph
+            ++ [ Element.paragraph [ Font.size 12 ] [ Element.text "Registered peers" ]
+               , Element.paragraph
                     [ Font.size 12
                     , Element.padding 5
                     ]
@@ -741,8 +735,7 @@ viewPeer model peer =
                                     |> String.concat
                                )
                     ]
-               ]
-            ++ [ Element.paragraph [ Font.size 12 ]
+               , Element.paragraph [ Font.size 12 ]
                     [ Element.text
                         ("Messages sent: " ++ String.fromInt peer.messagesSent)
                     ]
@@ -762,11 +755,11 @@ main : Program Flags Model Msg
 main =
     Browser.element
         { init =
-            \flags ->
+            \_ ->
                 List.foldl
                     (\address ( model, cmds ) ->
                         let
-                            ( peerSeed, newSeed ) =
+                            ( _, newSeed ) =
                                 Random.step (Random.int 0 999999) model.seed
                                     |> Tuple.mapFirst Random.initialSeed
 
@@ -775,7 +768,7 @@ main =
                                     (PeerMsg address Peer.RandomizePrefix)
                                     model
                         in
-                        ( modelOne, cmds ++ [ cmdOne ] )
+                        ( { modelOne | seed = newSeed }, cmds ++ [ cmdOne ] )
                     )
                     ( initialModel, [ Task.attempt GetSvgViewport Browser.Dom.getViewport ] )
                     (List.range 0 config.groupSize)

@@ -5,7 +5,7 @@ port module Peer exposing
     , Neighbor(..)
     , State
     , Vote
-    , chooseNeighbors
+    , prioritizePeers
     , decoderPeerView
     , initialModel
     , longestPrefix
@@ -14,9 +14,7 @@ port module Peer exposing
 
 import Array exposing (Array)
 import Array.Extra exposing (removeAt)
-import Bitwise
 import Debouncer.Messages as Debouncer exposing (Debouncer, fromSeconds, provideInput, settleWhenQuietFor, toDebouncer)
-import Dict exposing (Dict)
 import Json.Decode as D exposing (Decoder)
 import Json.Encode as E
 import List.Extra exposing (takeWhile)
@@ -62,7 +60,11 @@ type alias Model =
     , neighbees : Set Address
     , peerState : List Char
     , seed : Seed
-    , consensus : Maybe { voters : Set Address, vote : Vote }
+    , consensus :
+        Maybe
+            { voters : Set Address
+            , vote : Vote
+            }
     }
 
 
@@ -82,7 +84,7 @@ initialModel config address =
     , messagesSent = 0
     , messagesReceived = 0
     , neighbors =
-        chooseNeighbors address config.groupSize
+        prioritizePeers address config.groupSize
             |> Array.map
                 (\x ->
                     ( x
@@ -112,7 +114,10 @@ type alias State =
 
 
 type alias PeerView =
-    { state : State, voters : Set Address, vote : Vote }
+    { state : State
+    , voters : Set Address
+    , vote : Vote
+    }
 
 
 type Msg
@@ -285,7 +290,7 @@ update msg model =
                 | neighbors =
                     Array.map
                         (\( address, neighbor ) ->
-                            if neighbor == Offline then
+                            if address == peerAddress && neighbor == Offline then
                                 ( address, Unknown )
 
                             else
@@ -577,16 +582,18 @@ update msg model =
             update (UpdatePrefix (String.toList newString)) model
 
 
-chooseNeighbors : Address -> Int -> Array Address
-chooseNeighbors address groupSize =
+{-| prioritizePeers is used to construct the network overlay for group sync
+-}
+prioritizePeers : Address -> Int -> Array Address
+prioritizePeers address groupSize =
     -- includes yourself as first entry
     let
-        sortedPeers =
+        peersSortedByDistance =
             List.range 0 (groupSize - 1)
                 |> List.sortBy (\x -> min (abs (x - address)) (groupSize - abs (x - address)))
                 |> Array.fromList
 
-        indices =
+        popOrder =
             logBase 2 (toFloat groupSize)
                 |> ceiling
                 |> List.range 0
@@ -620,8 +627,8 @@ chooseNeighbors address groupSize =
                 Just e ->
                     ( newInput, Array.push e output )
         )
-        ( sortedPeers, Array.empty )
-        indices
+        ( peersSortedByDistance, Array.empty )
+        popOrder
         |> Tuple.second
 
 
@@ -673,15 +680,14 @@ updateNeighborStatus model ( receivedFromAddress, receivedStatus ) ( currentAddr
         case ( receivedStatus, currentStatus ) of
             ( Online newView, Online currentView ) ->
                 if
-                    (||)
-                        (newView.vote.peerWithThisState
-                            /= currentView.vote.peerWithThisState
-                        )
-                        (longestPrefix
-                            newView.vote.oldestState
-                            currentView.vote.oldestState
-                            /= newView.vote.oldestState
-                        )
+                    (newView.vote.peerWithThisState
+                        /= currentView.vote.peerWithThisState
+                    )
+                        || (longestPrefix
+                                newView.vote.oldestState
+                                currentView.vote.oldestState
+                                /= newView.vote.oldestState
+                           )
                 then
                     -- it means the new status is a longer sequence or a new
                     -- peer
@@ -703,15 +709,12 @@ updateNeighborStatus model ( receivedFromAddress, receivedStatus ) ( currentAddr
         case ( receivedStatus, currentStatus ) of
             ( Online receivedView, Online currentView ) ->
                 if
-                    (&&)
-                        (receivedFromAddress
-                            == currentView.vote.peerWithThisState
-                        )
-                        (longestPrefix
-                            receivedView.state
-                            currentView.vote.oldestState
-                            /= receivedView.state
-                        )
+                    (receivedFromAddress == currentView.vote.peerWithThisState)
+                        && (longestPrefix
+                                receivedView.state
+                                currentView.vote.oldestState
+                                /= receivedView.state
+                           )
                 then
                     -- This is the case where we received new state from a peer
                     -- (ex. Peer 2 says they are at state 'ABC' ) but this
@@ -722,16 +725,14 @@ updateNeighborStatus model ( receivedFromAddress, receivedStatus ) ( currentAddr
                     Stale currentView
 
                 else if
-                    (&&)
-                        (Set.member
-                            currentView.vote.peerWithThisState
-                            (Set.insert receivedView.vote.peerWithThisState receivedView.voters)
-                        )
-                        (longestPrefix
-                            receivedView.vote.oldestState
-                            currentView.vote.oldestState
-                            /= receivedView.vote.oldestState
-                        )
+                    Set.member
+                        currentView.vote.peerWithThisState
+                        (Set.insert receivedView.vote.peerWithThisState receivedView.voters)
+                        && (longestPrefix
+                                receivedView.vote.oldestState
+                                currentView.vote.oldestState
+                                /= receivedView.vote.oldestState
+                           )
                 then
                     -- This is the case where we received a new vote from a peer
                     -- (ex. Peer 3 says peer 2 is at state 'ABC'), but this
